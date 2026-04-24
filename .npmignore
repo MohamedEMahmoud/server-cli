@@ -1,0 +1,13 @@
+src/
+test/
+scripts/
+tsconfig.json
+tsup.config.ts
+vitest.config.ts
+*.md
+!README.md
+CURSOR_PROMPT.md
+SERVER_CLI_PLAN.md
+.htaccess
+static-server.cjs
+.cursor/
