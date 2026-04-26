@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from 'vitest';
 import {
   ensureSocketGitignore,
   injectSocketEnvBlock,
+  rewriteSocketEventsDoc,
   updateDocsDomain,
 } from '../src/core/socket-setup.js';
 import type { GlobalFlags } from '../src/types.js';
@@ -210,5 +211,163 @@ describe('updateDocsDomain', () => {
     expect(out).toMatch(/DOMAIN=new\.example\.com/);
     expect(out).toMatch(/Unrelated text with old\.example\.com/);
     expect(out).toMatch(/github\.com/);
+  });
+
+  test('does not rewrite tokens inside fenced code blocks', async () => {
+    const dir = path.join(tmpRoot, 'proj');
+    await makeProject(dir);
+    const md = [
+      '# Socket',
+      'See https://old.example.com/docs for more.',
+      '',
+      '```js',
+      "socket.emit('start-call', { room_id: 4 });",
+      'IO.socket(URI("https://old.example.com:4993"), options)',
+      "import { Socket } from 'socket.io-client-swift';",
+      '```',
+      '',
+      'Trailing prose with https://old.example.com/x.',
+    ].join('\n');
+    await fs.writeFile(path.join(dir, 'node', 'README.md'), md);
+    await updateDocsDomain(dir, 'new.example.com', flags());
+    const out = await fs.readFile(path.join(dir, 'node', 'README.md'), 'utf8');
+    // prose lines updated
+    expect(out).toContain('https://new.example.com/docs');
+    expect(out).toContain('https://new.example.com/x');
+    // code-block content preserved verbatim
+    expect(out).toContain("socket.emit('start-call', { room_id: 4 });");
+    expect(out).toContain('IO.socket(URI("https://old.example.com:4993"), options)');
+    expect(out).toContain("import { Socket } from 'socket.io-client-swift';");
+  });
+
+  test('does not corrupt code identifiers like socket.emit when no fence is present', async () => {
+    // Even outside fences, the tightened TLD list excludes "emit".
+    const dir = path.join(tmpRoot, 'proj');
+    await makeProject(dir);
+    const md = [
+      'Visit https://old.example.com today.',
+      'In code we call socket.emit on the client.',
+    ].join('\n');
+    await fs.writeFile(path.join(dir, 'node', 'README.md'), md);
+    await updateDocsDomain(dir, 'new.example.com', flags());
+    const out = await fs.readFile(path.join(dir, 'node', 'README.md'), 'utf8');
+    expect(out).toContain('https://new.example.com');
+    expect(out).toContain('socket.emit');
+  });
+});
+
+describe('rewriteSocketEventsDoc', () => {
+  async function setup(dir: string, doc: string): Promise<void> {
+    await makeProject(dir);
+    await fs.writeFile(path.join(dir, 'node', 'SOCKET-EVENTS.md'), doc);
+  }
+
+  test('updates the .env values table, SSL paths, and bare URLs from .env', async () => {
+    const dir = path.join(tmpRoot, 'proj');
+    const doc = [
+      '## 1) Active .env values',
+      '',
+      '| Key | Value |',
+      '|---|---|',
+      '| `NODE_HOST` | `dashboard.practice.4hoste.com` |',
+      '| `NODE_PORT` | `4995` |',
+      '| `APP_URL` | `https://backend.naseek-app.com` |',
+      '| `KEY` | `/var/cpanel/ssl/apache_tls/dashboard.practice.4hoste.com/combined` |',
+      '| `CERT` | `/var/cpanel/ssl/apache_tls/dashboard.practice.4hoste.com/certificates` |',
+      '| `CA` | `/var/cpanel/ssl/apache_tls/dashboard.practice.4hoste.com/combined` |',
+      '',
+      '### Active Socket endpoint',
+      '',
+      '```',
+      'https://backend.naseek-app.com:4993',
+      '```',
+      '',
+      'CORS origin: https://backend.naseek-app.com',
+      'GitHub: https://github.com/socketio/socket.io-client-swift',
+    ].join('\n');
+    await setup(dir, doc);
+    await injectSocketEnvBlock(
+      dir,
+      { domain: 'backend.naseek-app.com', port: 4993 },
+      flags(),
+    );
+    await rewriteSocketEventsDoc(dir, 'backend.naseek-app.com', 4993, flags());
+    const out = await fs.readFile(path.join(dir, 'node', 'SOCKET-EVENTS.md'), 'utf8');
+    // Stale values gone everywhere
+    expect(out).not.toContain('dashboard.practice.4hoste.com');
+    expect(out).not.toContain('4995');
+    // Table rows refreshed
+    expect(out).toContain('| `NODE_HOST` | `backend.naseek-app.com` |');
+    expect(out).toContain('| `NODE_PORT` | `4993` |');
+    expect(out).toContain(
+      '| `KEY` | `/var/cpanel/ssl/apache_tls/backend.naseek-app.com/combined` |',
+    );
+    expect(out).toContain(
+      '| `CERT` | `/var/cpanel/ssl/apache_tls/backend.naseek-app.com/certificates` |',
+    );
+    expect(out).toContain(
+      '| `CA` | `/var/cpanel/ssl/apache_tls/backend.naseek-app.com/combined` |',
+    );
+    // Endpoint and CORS preserved or normalized
+    expect(out).toContain('https://backend.naseek-app.com:4993');
+    expect(out).toContain('https://backend.naseek-app.com');
+    // External links untouched
+    expect(out).toContain('https://github.com/socketio/socket.io-client-swift');
+  });
+
+  test('reads canonical NODE_HOST/NODE_PORT from .env, not just args', async () => {
+    const dir = path.join(tmpRoot, 'proj');
+    const doc = [
+      '| `NODE_HOST` | `old.example.com` |',
+      '| `NODE_PORT` | `1111` |',
+      'Endpoint: https://old.example.com:1111',
+    ].join('\n');
+    await setup(dir, doc);
+    // .env is the source of truth (env-host / 9999); function args are stale.
+    await fs.writeFile(
+      path.join(dir, '.env'),
+      ['NODE_HOST=env-host.example.com', 'NODE_PORT=9999', ''].join('\n'),
+    );
+    await rewriteSocketEventsDoc(dir, 'arg-host.example.com', 2222, flags());
+    const out = await fs.readFile(path.join(dir, 'node', 'SOCKET-EVENTS.md'), 'utf8');
+    expect(out).toContain('| `NODE_HOST` | `env-host.example.com` |');
+    expect(out).toContain('| `NODE_PORT` | `9999` |');
+    expect(out).toContain('https://env-host.example.com:9999');
+    expect(out).not.toContain('arg-host.example.com');
+    expect(out).not.toContain('2222');
+  });
+
+  test('falls back to args when .env is missing or has no NODE_HOST', async () => {
+    const dir = path.join(tmpRoot, 'proj');
+    const doc = '| `NODE_HOST` | `old.example.com` |\n';
+    await setup(dir, doc);
+    // No .env at all → use the args.
+    await rewriteSocketEventsDoc(dir, 'fallback.example.com', 7000, flags());
+    const out = await fs.readFile(path.join(dir, 'node', 'SOCKET-EVENTS.md'), 'utf8');
+    expect(out).toContain('| `NODE_HOST` | `fallback.example.com` |');
+  });
+
+  test('dry-run does not modify the file', async () => {
+    const dir = path.join(tmpRoot, 'proj');
+    const doc = '| `NODE_HOST` | `old.example.com` |\n';
+    await setup(dir, doc);
+    await rewriteSocketEventsDoc(dir, 'new.example.com', 4993, flags({ dryRun: true }));
+    const out = await fs.readFile(path.join(dir, 'node', 'SOCKET-EVENTS.md'), 'utf8');
+    expect(out).toBe(doc);
+  });
+
+  test('idempotent — running twice produces identical content', async () => {
+    const dir = path.join(tmpRoot, 'proj');
+    const doc = [
+      '| `NODE_HOST` | `old.example.com` |',
+      '| `NODE_PORT` | `1111` |',
+      'https://old.example.com:1111',
+    ].join('\n');
+    await setup(dir, doc);
+    await rewriteSocketEventsDoc(dir, 'a.example.com', 4993, flags());
+    const first = await fs.readFile(path.join(dir, 'node', 'SOCKET-EVENTS.md'), 'utf8');
+    await rewriteSocketEventsDoc(dir, 'a.example.com', 4993, flags());
+    const second = await fs.readFile(path.join(dir, 'node', 'SOCKET-EVENTS.md'), 'utf8');
+    expect(second).toBe(first);
   });
 });
