@@ -6,6 +6,7 @@ import { findFreePort } from './core/auto-port.js';
 import type { GlobalFlags, ProjectType } from './types.js';
 import { ServerCliError } from './utils/errors.js';
 import { logger, setVerbose } from './utils/logger.js';
+import { chmodPublicHtml } from './core/chmod-public-html.js';
 import { runChange } from './commands/change.js';
 import { runDelete } from './commands/delete.js';
 import { runDoctor } from './commands/doctor.js';
@@ -229,30 +230,23 @@ Global options:
 
     const cmd = rest[0];
     const tail = rest.slice(1);
+    let ranDir: string | undefined;
+    let handled = false;
     if (cmd && KNOWN.has(cmd)) {
-      const handled = await routeKnown(cmd, tail, flags);
-      if (handled) return;
+      handled = await routeKnown(cmd, tail, flags);
+    }
+    if (!handled) {
+      const parsed = parseArgs(rest);
+      const ctx = await buildResolvedContext(parsed, flags);
+      ranDir = ctx.dir;
+      if (ctx.type === 'socket') await runSocket(ctx);
+      else if (ctx.type === 'supervisor') await runSupervisor(ctx);
+      else if (ctx.type === 'next') await runNext(ctx);
+      else if (ctx.type === 'nuxt') await runNuxt(ctx);
+      else throw new ServerCliError('unsupported project type', { code: 40 });
     }
 
-    const parsed = parseArgs(rest);
-    const ctx = await buildResolvedContext(parsed, flags);
-    if (ctx.type === 'socket') {
-      await runSocket(ctx);
-      return;
-    }
-    if (ctx.type === 'supervisor') {
-      await runSupervisor(ctx);
-      return;
-    }
-    if (ctx.type === 'next') {
-      await runNext(ctx);
-      return;
-    }
-    if (ctx.type === 'nuxt') {
-      await runNuxt(ctx);
-      return;
-    }
-    throw new ServerCliError('unsupported project type', { code: 40 });
+    await chmodPublicHtml(flags, ranDir);
   } catch (e) {
     if (e instanceof ServerCliError) {
       logger.error(`✖ ${e.message}`);
